@@ -2,259 +2,89 @@ package main
 
 import (
 	"net"
+	"sync/atomic"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 )
 
 const MTU = 1500
-const MaxUdpPayload = MTU - 28
-const IpFragOffsetStep = (MTU - 20) / 8
-const packetID uint16 = 12345
+const IPv4HeaderSize = 20
+
+// IP payload carried by each fragment, must be a multiple of 8 (1480)
+const MaxFragmentPayload = (MTU - IPv4HeaderSize) &^ 7
+
+// IP identification, must be unique per datagram so the receiver does not mix fragments
+var ipID atomic.Uint32
 
 type UdpFrameOptions struct {
 	sourceIP, destIP     net.IP
 	sourcePort, destPort uint16
-	sourceMac, destMac   net.HardwareAddr
-	isIPv6               bool
 	payloadBytes         []byte
 }
 
-type serializableNetworkLayer interface {
-	gopacket.NetworkLayer
-	SerializeTo(b gopacket.SerializeBuffer, opts gopacket.SerializeOptions) error
-}
-
-// createSerializedUDPFrame creates an Ethernet frame encapsulating our UDP
-// packet for injection to the local network
-func createSerializedUDPFrame(opts UdpFrameOptions) ([][]byte, error) {
-	// EthernetHeader = 14
-	// IP  Header = 20  <--+
-	// UCP header = 8   <--+-- 1500 == MTU
-	// Payload 6-1472   <--+
-	// CRC 4
-
-	//udpPayloadSize := len(opts.payloadBytes)
-	slogger.Debugf("payloadSize=%v", len(opts.payloadBytes))
-
-	if len(opts.payloadBytes) > MaxUdpPayload { // MTU = 1500 = 1472 + 8 + 20
-		slogger.Debug("UDP payload bigger than 1472 bytes, will be fragmented in several packets")
-		return udpPacketFragmentationControl(opts)
-	} else {
-		return udpOnePacket(opts)
-	}
-
-}
-
-func udpPacketFragmentationControl(opts UdpFrameOptions) ([][]byte, error) {
-	// EthernetHeader = 14
+// createSerializedUDPPackets creates the IPv4 packets (header included) carrying
+// our UDP datagram, fragmented when it does not fit in the MTU.
+// Routing and link layer are left to the kernel.
+func createSerializedUDPPackets(opts UdpFrameOptions) ([][]byte, error) {
 	// IP  Header = 20  <--+
 	// UDP header = 8   <--+-- 1500 == MTU
-	// Payload 6-1472   <--+
-	// CRC 4
-	udpPayloadSize := len(opts.payloadBytes)
-
-	factor := 1 + (udpPayloadSize - (MTU - 28))
-	numberOfFragments := 1 + factor/(MTU-20)
-
-	if factor%(MTU-20) > 0 {
-		numberOfFragments++
-	}
-
-	slicePackets := make([][]byte, numberOfFragments)
-
-	slogger.Debugf("numberOfFragments=%v", numberOfFragments)
-
-	//Used to calculate checksum and IP packet length
-	udp2 := &layers.UDP{
-		SrcPort: layers.UDPPort(opts.sourcePort),
-		DstPort: layers.UDPPort(opts.destPort),
-		Length:  uint16(len(opts.payloadBytes) + 8),
-	}
-
-	for i := 0; i < numberOfFragments; i++ {
-		buf := gopacket.NewSerializeBuffer()
-		slogger.Debugf("packet %d", i)
-		serializeOpts := gopacket.SerializeOptions{
-			FixLengths:       false,
-			ComputeChecksums: false,
-		}
-		serializeOpts2 := gopacket.SerializeOptions{
-			FixLengths:       true,
-			ComputeChecksums: true,
-		}
-
-		ethernetType := layers.EthernetTypeIPv4
-		if opts.isIPv6 {
-			ethernetType = layers.EthernetTypeIPv6
-		}
-		eth := &layers.Ethernet{
-			SrcMAC:       opts.sourceMac,
-			DstMAC:       opts.destMac,
-			EthernetType: ethernetType,
-		}
-
-		var flags layers.IPv4Flag
-
-		if i < numberOfFragments-1 {
-			flags = layers.IPv4MoreFragments
-			slogger.Debugf("IPv4MoreFragments")
-		} else {
-			flags = 0
-			slogger.Debugf("flags = 0")
-		}
-
-		ip := &layers.IPv4{
-			Id:         uint16(packetID),
-			SrcIP:      opts.sourceIP,
-			DstIP:      opts.destIP,
-			Protocol:   layers.IPProtocolUDP,
-			Version:    4,
-			TTL:        64,
-			FragOffset: IpFragOffsetStep * uint16(i),
-			Flags:      flags,
-			IHL:        5,
-		}
-
-		var udp *layers.UDP
-
-		if i == 0 {
-			//PseudoHeader used to calculate UDP Checksum
-			ipPseudoHeader := &layers.IPv4{
-				Id:         uint16(packetID),
-				SrcIP:      opts.sourceIP,
-				DstIP:      opts.destIP,
-				Protocol:   layers.IPProtocolUDP,
-				Version:    4,
-				TTL:        64,
-				FragOffset: 0,
-				Flags:      0,
-				IHL:        5,
-				Length:     1500,
-			}
-
-			udp2.SetNetworkLayerForChecksum(ipPseudoHeader)
-			err := gopacket.SerializeLayers(buf, serializeOpts2, eth, ipPseudoHeader, udp2, gopacket.Payload(opts.payloadBytes))
-
-			slogger.Debugf("udp2.Checksum = %v", udp2.Checksum)
-
-			if err != nil {
-				return nil, err
-			}
-
-			udp = &layers.UDP{
-				SrcPort:  layers.UDPPort(opts.sourcePort),
-				DstPort:  layers.UDPPort(opts.destPort),
-				Length:   udp2.Length,
-				Checksum: udp2.Checksum,
-			}
-		}
-		stopSlicePos := 0
-		startSlicePos := 0
-
-		if i == 0 {
-			startSlicePos = 0
-			stopSlicePos = (i+1)*IpFragOffsetStep*8 - 8 //1480 -8 = 1472
-		} else {
-			startSlicePos = i*IpFragOffsetStep*8 - 8
-			stopSlicePos = (i+1)*IpFragOffsetStep*8 - 8
-		}
-
-		if stopSlicePos > len(opts.payloadBytes) {
-			stopSlicePos = len(opts.payloadBytes)
-		}
-		slogger.Debugf("startSlicePos = %d, stopSlicePos = %d", startSlicePos, stopSlicePos)
-		slogger.Debugf("len(payloadBytes) = %d", len(opts.payloadBytes))
-		payloadFragmented := opts.payloadBytes[startSlicePos:stopSlicePos]
-		slogger.Debugf("len(payloadFragmented) = %d", len(payloadFragmented))
-		slogger.Debugf("payloadFragmented = [%v]", payloadFragmented)
-
-		if i == 0 {
-			ip.Length = uint16(len(payloadFragmented) + 8 + 20)
-		} else {
-			ip.Length = uint16(len(payloadFragmented) + 20)
-		}
-
-		slogger.Debugf("ip = %v", ip)
-
-		if i == 0 {
-
-			udp.SetNetworkLayerForChecksum(ip)
-
-			//Para calcular o IP checksum
-			err := gopacket.SerializeLayers(buf, serializeOpts2, eth, ip, udp, gopacket.Payload(payloadFragmented))
-			if err != nil {
-				return nil, err
-			}
-			ip.Length = MTU
-			udp.Length = udp2.Length
-			udp.Checksum = udp2.Checksum
-			slogger.Debugf("ip.checksum = %v, ip.Length = %v, udp.Checksum=%v, udp.Length=%v", ip.Checksum, ip.Length, udp.Checksum, udp.Length)
-
-			err = gopacket.SerializeLayers(buf, serializeOpts, eth, ip, udp, gopacket.Payload(payloadFragmented))
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			err := gopacket.SerializeLayers(buf, serializeOpts2, eth, ip, gopacket.Payload(payloadFragmented))
-			if err != nil {
-				return nil, err
-			}
-		}
-		slicePackets[i] = buf.Bytes()
-		slogger.Debugf("len(slicePackets) = [%d]", len(slicePackets))
-	}
-
-	return slicePackets, nil
-}
-
-func udpOnePacket(opts UdpFrameOptions) ([][]byte, error) {
-
-	buf := gopacket.NewSerializeBuffer()
+	// Payload 0-1472   <--+
+	// Next fragments carry 1480 bytes of the UDP datagram each
 	serializeOpts := gopacket.SerializeOptions{
 		FixLengths:       true,
 		ComputeChecksums: true,
 	}
-	ethernetType := layers.EthernetTypeIPv4
-	if opts.isIPv6 {
-		ethernetType = layers.EthernetTypeIPv6
-	}
-	eth := &layers.Ethernet{
-		SrcMAC:       opts.sourceMac,
-		DstMAC:       opts.destMac,
-		EthernetType: ethernetType,
-	}
-	var ip serializableNetworkLayer
 
-	if !opts.isIPv6 {
-		ip = &layers.IPv4{
-			SrcIP:    opts.sourceIP,
-			DstIP:    opts.destIP,
-			Protocol: layers.IPProtocolUDP,
-			Version:  4,
-			TTL:      32,
-		}
-	} else {
-		ip = &layers.IPv6{
-			SrcIP:      opts.sourceIP,
-			DstIP:      opts.destIP,
-			NextHeader: layers.IPProtocolUDP,
-			Version:    6,
-			HopLimit:   32,
-		}
-		ip.LayerType()
+	// Serialize the whole UDP datagram once, so the checksum covers the full payload
+	pseudoHeader := &layers.IPv4{
+		SrcIP:    opts.sourceIP,
+		DstIP:    opts.destIP,
+		Protocol: layers.IPProtocolUDP,
 	}
-
 	udp := &layers.UDP{
 		SrcPort: layers.UDPPort(opts.sourcePort),
 		DstPort: layers.UDPPort(opts.destPort),
 	}
-	udp.SetNetworkLayerForChecksum(ip)
-	err := gopacket.SerializeLayers(buf, serializeOpts, eth, ip, udp, gopacket.Payload(opts.payloadBytes))
-	if err != nil {
+	udp.SetNetworkLayerForChecksum(pseudoHeader)
+	udpBuf := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(udpBuf, serializeOpts, udp, gopacket.Payload(opts.payloadBytes)); err != nil {
 		return nil, err
 	}
-	slicePackets := make([][]byte, 1)
-	slicePackets[0] = buf.Bytes()
+	datagram := udpBuf.Bytes()
+
+	id := uint16(ipID.Add(1))
+	numberOfFragments := (len(datagram) + MaxFragmentPayload - 1) / MaxFragmentPayload
+	slogger.Debugf("payloadSize=%d, numberOfFragments=%d, id=%d", len(opts.payloadBytes), numberOfFragments, id)
+
+	slicePackets := make([][]byte, 0, numberOfFragments)
+	for offset := 0; offset < len(datagram); offset += MaxFragmentPayload {
+		end := offset + MaxFragmentPayload
+		var flags layers.IPv4Flag
+		if end < len(datagram) {
+			flags = layers.IPv4MoreFragments
+		} else {
+			end = len(datagram)
+		}
+
+		ip := &layers.IPv4{
+			Version:    4,
+			IHL:        5,
+			TTL:        64,
+			Id:         id,
+			Flags:      flags,
+			FragOffset: uint16(offset / 8),
+			Protocol:   layers.IPProtocolUDP,
+			SrcIP:      opts.sourceIP,
+			DstIP:      opts.destIP,
+		}
+
+		buf := gopacket.NewSerializeBuffer()
+		if err := gopacket.SerializeLayers(buf, serializeOpts, ip, gopacket.Payload(datagram[offset:end])); err != nil {
+			return nil, err
+		}
+		slicePackets = append(slicePackets, buf.Bytes())
+	}
+
 	return slicePackets, nil
 }

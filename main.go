@@ -6,8 +6,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-
-	"github.com/google/gopacket/pcap"
 )
 
 func main() {
@@ -41,13 +39,11 @@ func main() {
 		}
 	}()
 
-	//handle, err := pcap.OpenLive(config.InterfaceName, int32(config.MaxPacketSize), false, pcap.BlockForever)
-	handle, err := pcap.OpenLive(config.InterfaceName, 65527, false, pcap.BlockForever)
-
+	sender, err := newRawSender(config.InterfaceName)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer handle.Close()
+	defer sender.Close()
 
 	addr := net.UDPAddr{
 		Port: int(config.UdpPortReceiver),
@@ -57,7 +53,7 @@ func main() {
 	slogger.Infof(listenStr)
 	fmt.Print(listenStr)
 
-	conn, err := net.ListenUDP("udp", &addr) // code does not block here
+	conn, err := net.ListenUDP("udp4", &addr) // code does not block here
 	if err != nil {
 		slogger.Fatalf("Unable to listern on address [%v]: %s", addr, err)
 	}
@@ -71,16 +67,12 @@ func main() {
 			slogger.Fatalf("Unable to read from connection]: %s", err)
 		}
 		slogger.Infof("Data read from [%v], length %d", remote, rlen)
-		handlePacket2(handle, buf[:rlen], remote, config)
+		handlePacket2(sender, buf[:rlen], remote, config)
 	}
 }
 
-func handlePacket2(handle *pcap.Handle, payload []byte, remote *net.UDPAddr, config *Config) {
+func handlePacket2(sender *rawSender, payload []byte, remote *net.UDPAddr, config *Config) {
 	var udpFrameOptions UdpFrameOptions
-
-	udpFrameOptions.sourceMac = config.MacAddressReceiver
-
-	slogger.Debugf("udpFrameOptions.sourceMac = %v", udpFrameOptions.sourceMac)
 
 	udpFrameOptions.sourceIP = remote.IP
 	udpFrameOptions.sourcePort = uint16(remote.Port)
@@ -89,26 +81,23 @@ func handlePacket2(handle *pcap.Handle, payload []byte, remote *net.UDPAddr, con
 
 	for _, destination := range config.Destinations {
 		udpFrameOptions.destIP = destination.IpAddress
-		udpFrameOptions.destMac = destination.MacAddress
 		udpFrameOptions.destPort = destination.Port
-		udpFrameOptions.isIPv6 = false
 
 		slogger.Debugf("udpFrameOptions.destIP = %v", udpFrameOptions.destIP)
 		slogger.Debugf("udpFrameOptions.destPort = %v", udpFrameOptions.destPort)
-		slogger.Debugf("udpFrameOptions.destMac = %v", udpFrameOptions.destMac)
 
-		sliceFrameBytes, err := createSerializedUDPFrame(udpFrameOptions)
+		slicePackets, err := createSerializedUDPPackets(udpFrameOptions)
 
 		if err != nil {
-			slogger.Errorf("Error serializing UDP frame to send to destination %s : %s", destination.IpAddress.String(), err)
+			slogger.Errorf("Error serializing UDP packet to send to destination %s : %s", destination.IpAddress.String(), err)
 			continue
 		}
-		slogger.Debugf("len(sliceFrameBytes) = %d", len(sliceFrameBytes))
+		slogger.Debugf("len(slicePackets) = %d", len(slicePackets))
 		slogger.Debugf("Sending data to %s", destination.IpAddress.String())
 
-		for i, frame := range sliceFrameBytes {
-			slogger.Debugf("Sending frame[%d] = %v", i, frame)
-			if err := handle.WritePacketData(frame); err != nil {
+		for i, packet := range slicePackets {
+			slogger.Debugf("Sending packet[%d] = %v", i, packet)
+			if err := sender.Send(destination.IpAddress, packet); err != nil {
 				slogger.Errorf("Error Writing UDP data to destination %s : %s ", destination.IpAddress.String(), err)
 			}
 		}

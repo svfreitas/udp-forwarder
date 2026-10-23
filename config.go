@@ -7,8 +7,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-
-	"github.com/j-keck/arping"
 )
 
 type rawConfig struct {
@@ -18,29 +16,25 @@ type rawConfig struct {
 	LogFileMaxBackups  int      `json:"log_file_max_backups"`
 	LogLevelConfigPort int      `json:"log_level_config_port"`
 	IpAddressReceiver  string   `json:"ip_address_receiver"`
-	DefaultGateway     string   `json:"default_gateway"`
 	MaxPacketSize      int      `json:"max_packet_size"`
 	Destinations       []string `json:"destinations"`
 }
 
 type Config struct {
-	InterfaceName           string
-	LogLevelConfigPort      int
-	LogFileLocation         string
-	LogFileSize             int
-	LogFileMaxBackups       int
-	IpAddressReceiver       net.IP
-	UdpPortReceiver         uint16
-	MacAddresDefaultGateway net.HardwareAddr
-	MacAddressReceiver      net.HardwareAddr
-	MaxPacketSize           int
-	Destinations            []Destination
+	InterfaceName      string
+	LogLevelConfigPort int
+	LogFileLocation    string
+	LogFileSize        int
+	LogFileMaxBackups  int
+	IpAddressReceiver  net.IP
+	UdpPortReceiver    uint16
+	MaxPacketSize      int
+	Destinations       []Destination
 }
 
 type Destination struct {
-	IpAddress  net.IP
-	MacAddress net.HardwareAddr
-	Port       uint16
+	IpAddress net.IP
+	Port      uint16
 }
 
 func LoadConfiguration(filename string) (*Config, error) {
@@ -93,16 +87,12 @@ func LoadConfiguration(filename string) (*Config, error) {
 	}
 
 	config.IpAddressReceiver = net.ParseIP(host)
-	if config.IpAddressReceiver == nil {
-		log.Fatal("ip_address_receiver bad format for host")
+	if config.IpAddressReceiver == nil || config.IpAddressReceiver.To4() == nil {
+		log.Fatal("ip_address_receiver bad format for host, must be an IPv4 address")
 	}
 
-	// find MAC address of receiver IP
-	netInterface, err := net.InterfaceByName(config.InterfaceName)
-	if err != nil {
-		log.Fatalf("MAC address resolution problem for Receiver interface_name: %s", err)
-	} else {
-		config.MacAddressReceiver = netInterface.HardwareAddr
+	if _, err := net.InterfaceByName(config.InterfaceName); err != nil {
+		log.Fatalf("interface_name problem: %s", err)
 	}
 
 	portUint, err := strconv.ParseUint(port, 10, 16)
@@ -113,17 +103,6 @@ func LoadConfiguration(filename string) (*Config, error) {
 
 	config.MaxPacketSize = rawConfig.MaxPacketSize
 
-	dg := net.ParseIP(rawConfig.DefaultGateway)
-	if dg == nil {
-		log.Fatal("DefaultGateway bad format")
-	}
-
-	if hwAddr, _, err := arping.Ping(dg); err != nil {
-		log.Fatalf("MAC address resolution problem for DefaultGateway: %s", err)
-	} else {
-		config.MacAddresDefaultGateway = hwAddr
-	}
-
 	for _, rawDest := range rawConfig.Destinations {
 		var dest Destination
 		host, port, err := net.SplitHostPort(rawDest)
@@ -132,8 +111,8 @@ func LoadConfiguration(filename string) (*Config, error) {
 		}
 
 		dest.IpAddress = net.ParseIP(host)
-		if dest.IpAddress == nil {
-			log.Fatalf("IpAddressDestination bad format for Destination:%s", rawDest)
+		if dest.IpAddress == nil || dest.IpAddress.To4() == nil {
+			log.Fatalf("IpAddressDestination bad format for Destination, must be an IPv4 address: %s", rawDest)
 		}
 
 		uPort, err := strconv.ParseUint(port, 10, 16)
@@ -142,39 +121,9 @@ func LoadConfiguration(filename string) (*Config, error) {
 		}
 		dest.Port = uint16(uPort)
 
-		dest.MacAddress = findMacAddress(dest.IpAddress, host, netInterface, config.MacAddresDefaultGateway)
-
 		config.Destinations = append(config.Destinations, dest)
 	}
 
 	return &config, nil
 
-}
-
-func findMacAddress(ipAddress net.IP, host string, netInterface *net.Interface, defaulGatewayMacAddress net.HardwareAddr) net.HardwareAddr {
-	var hwAddr net.HardwareAddr
-	var err error
-	var found bool
-
-	if hwAddr, _, err = arping.Ping(ipAddress); err != nil {
-		sliceAddresses, err := netInterface.Addrs()
-		if err != nil {
-			log.Printf("Failed to obtain addresses assigned to = %v with error = %v", netInterface, err)
-		} else {
-			log.Printf("sliceAddresses = %v", sliceAddresses)
-			for _, v := range sliceAddresses {
-				if strings.Contains(v.String(), host) {
-					hwAddr = netInterface.HardwareAddr
-					found = true
-					log.Print("Host match as a local IP, setting hardware address as the interface HW adress")
-					break
-				}
-			}
-		}
-		if !found {
-			log.Printf("MAC address resolution problem for Destination: %s, setting Default Gateway MAC Address", ipAddress.String())
-			hwAddr = defaulGatewayMacAddress
-		}
-	}
-	return hwAddr
 }
